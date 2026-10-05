@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Bundled wheels / local artifacts
+*.whl
+*.log
+debug_dump/

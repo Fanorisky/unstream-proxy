@@ -1,0 +1,14 @@
+{
+  "apps": [
+    {
+      "name": "anthropic-proxy",
+      "script": "Proxy.py",
+      "env": {
+        "HOST": "127.0.0.1",
+        "PORT": "8181",
+        "TARGET_URL": "https://api.justwoker.icu",
+        "API_KEY": ""
+      }
+    }
+  ]
+}
