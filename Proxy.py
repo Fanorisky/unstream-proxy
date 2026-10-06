@@ -381,7 +381,6 @@ NATIVE_MAP = {
     "Grep": "grep",
     "Glob": "glob",
     "WebFetch": "web_fetch",
-    "TodoWrite": "todowrite",
     "AskUserQuestion": "ask_user_question",
     "Task": "task",
     "Agent": "task",
@@ -1058,7 +1057,44 @@ def clean_arguments(arguments, tool):
         if isinstance(value, str) and value.startswith("@"):
             value = value[1:]  # the relay's own tools use stage paths
         cleaned[key] = value
+    # The relay's own tools (e.g. system_todo_write -> TodoWrite) omit required
+    # fields the client's schema demands, and the client rejects a call that is
+    # missing one. Backfill array-item required strings from a sibling field so
+    # the call validates. This copies data that is already present; it invents
+    # nothing. Measured 2026-10-06: the relay drops activeForm from every todo.
+    cleaned = _backfill_required(cleaned, schema)
     return cleaned
+
+
+def _backfill_required(arguments, schema):
+    """Fill required string fields in array items from a present sibling.
+
+    Only touches arrays of objects whose item schema marks a string field
+    required but absent. The value is copied from another present field on the
+    same item (preferring one named 'content'/'label'/'name'), never fabricated.
+    """
+    for key, prop in (schema.get("properties") or {}).items():
+        if (prop or {}).get("type") != "array":
+            continue
+        item_schema = (prop.get("items") or {})
+        req = item_schema.get("required") or []
+        item_props = item_schema.get("properties") or {}
+        rows = arguments.get(key)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            source = (row.get("content") or row.get("label") or row.get("name")
+                      or next((v for v in row.values() if isinstance(v, str)), None))
+            for field in req:
+                if field in row:
+                    continue
+                if (item_props.get(field) or {}).get("type") != "string":
+                    continue
+                if source is not None:
+                    row[field] = source
+    return arguments
 
 
 def remap_tool_calls(response_data, client_tools, native_reverse=None):
