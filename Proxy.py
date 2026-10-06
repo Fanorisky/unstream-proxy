@@ -1114,8 +1114,10 @@ def remap_tool_calls(response_data, client_tools, native_reverse=None):
     native_reverse = native_reverse or {}
     by_name = {t.get("name"): t for t in client_tools or [] if isinstance(t, dict)}
     aliases = config.get("tool_aliases") or {}
+    rebuilt = []
     for block in response_data.get("content") or []:
         if not isinstance(block, dict) or block.get("type") != "tool_use":
+            rebuilt.append(block)
             continue
         name = block.get("name")
         client_name = native_reverse.get(name)
@@ -1124,16 +1126,47 @@ def remap_tool_calls(response_data, client_tools, native_reverse=None):
             if client_name in by_name:
                 block["input"] = clean_arguments(block.get("input"), by_name[client_name])
             log_message(f"Native tool call: {name} -> {client_name}")
+            rebuilt.append(block)
             continue
-        if not aliases or not by_name or name in by_name:
+        if name in by_name:
+            rebuilt.append(block)
             continue
-        target = aliases.get(name)
-        if not target or target not in by_name:
+        target = aliases.get(name) if aliases else None
+        if target and target in by_name:
+            block["name"] = target
+            block["input"] = clean_arguments(block.get("input"), by_name[target])
+            log_message(f"Remapped upstream tool call: {name} -> {target}")
+            rebuilt.append(block)
             continue
-        block["name"] = target
-        block["input"] = clean_arguments(block.get("input"), by_name[target])
-        log_message(f"Remapped upstream tool call: {name} -> {target}")
+        # Orphan: a call for a tool the client never declared and that has no
+        # client equivalent - typically one of the relay's own injected tools
+        # (system_todo_write, read_tabular) surfacing because its kiro prompt
+        # describes them. Passing the raw name through makes the client abort with
+        # "No such tool available"; render it as text instead so the turn survives.
+        log_message(f"Orphan upstream tool call {name!r} -> text (no client equivalent)")
+        rebuilt.append({"type": "text", "text": render_orphan_tool_call(name, block.get("input"))})
+    if rebuilt:
+        response_data["content"] = rebuilt
     return response_data
+
+
+def render_orphan_tool_call(name, tool_input):
+    """Turn a tool_use the client cannot run into readable text."""
+    tool_input = tool_input if isinstance(tool_input, dict) else {}
+    todos = tool_input.get("todos")
+    if isinstance(todos, list) and todos:
+        mark = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]"}
+        lines = ["Todo list:"]
+        for item in todos:
+            if not isinstance(item, dict):
+                continue
+            box = mark.get(item.get("status"), "[ ]")
+            lines.append(f"- {box} {item.get('content', '')}".rstrip())
+        return "\n".join(lines)
+    if tool_input:
+        detail = ", ".join(f"{k}={v!r}" for k, v in tool_input.items())
+        return f"({name}: {detail})"
+    return f"({name})"
 
 
 def strip_emulation_noise(text):
