@@ -372,15 +372,20 @@ def passthrough_error(response):
 # protocol below. Capitalised names look dropped, which is why this used to be
 # mistaken for "the relay ignores client tools" - popping `tools` entirely was what
 # produced the "Tool 'X' not found" confabulation.
+#
+# Deliberately NOT native, though the relay accepts the names (measured 2026-10-06,
+# forced calls): Edit - the relay fills its own read_tabular/pandas_operations
+# args and drops old_string/new_string every time; WebFetch - drops the required
+# prompt; TodoWrite - drops the required activeForm. All three route in-band, where
+# the client model fills the schema correctly. Fields that can be derived from a
+# sibling are also backfilled in clean_arguments as a second safety net.
 NATIVE_MAP = {
     # name the client declares -> name this relay honours natively
     "Read": "read",
     "Write": "write",
-    "Edit": "edit",
     "Bash": "bash",
     "Grep": "grep",
     "Glob": "glob",
-    "WebFetch": "web_fetch",
     "AskUserQuestion": "ask_user_question",
     "Task": "task",
     "Agent": "task",
