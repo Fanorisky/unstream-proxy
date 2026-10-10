@@ -234,6 +234,48 @@ assert "<parameter" in call_with_tag[1]["content"]
 print("JSON body with <parameter string correctly preserved!")
 print("Test 15 passed!")
 
+# Test 16: RETRY_EXCEPTION_DELAYS expanded for network flap resilience
+print("\n--- Test 16: RETRY_EXCEPTION_DELAYS resilience ---")
+assert Proxy.RETRY_EXCEPTION_DELAYS == (1.0, 2.0, 4.0), f"Unexpected delays: {Proxy.RETRY_EXCEPTION_DELAYS}"
+print("RETRY_EXCEPTION_DELAYS verified:", Proxy.RETRY_EXCEPTION_DELAYS)
+print("Test 16 passed!")
+
+# Test 17: proxy_messages returns 502 on URLError / DNS failure
+print("\n--- Test 17: proxy_messages returns 502 on URLError / DNS failure ---")
+import socket
+import urllib.error
+
+orig_forward = Proxy.forward_request
+try:
+    Proxy.request.bind(b'{"model":"claude-3-opus-20240229","messages":[{"role":"user","content":"hi"}]}', {"anthropic-version": "2023-06-01"})
+    Proxy.forward_request = lambda b, h: (_ for _ in ()).throw(urllib.error.URLError(socket.gaierror(11001, "getaddrinfo failed")))
+    res, status = Proxy.proxy_messages()
+    assert status == 502, f"Expected status 502, got {status}"
+    res_data = json.loads(res.body.decode("utf-8"))
+    assert res_data.get("type") == "error"
+    assert res_data.get("error", {}).get("type") == "api_error"
+    assert "getaddrinfo failed" in res_data["error"]["message"]
+    print("URLError correctly transformed to 502 Anthropic error payload:", res_data)
+finally:
+    Proxy.forward_request = orig_forward
+print("Test 17 passed!")
+
+# Test 18: proxy_messages returns 504 on timeout
+print("\n--- Test 18: proxy_messages returns 504 on timeout ---")
+try:
+    Proxy.request.bind(b'{"model":"claude-3-opus-20240229","messages":[{"role":"user","content":"hi"}]}', {"anthropic-version": "2023-06-01"})
+    Proxy.forward_request = lambda b, h: (_ for _ in ()).throw(TimeoutError("Operation timed out"))
+    res, status = Proxy.proxy_messages()
+    assert status == 504, f"Expected status 504, got {status}"
+    res_data = json.loads(res.body.decode("utf-8"))
+    assert res_data.get("type") == "error"
+    assert res_data.get("error", {}).get("type") == "api_error"
+    assert "timed out" in res_data["error"]["message"].lower()
+    print("Timeout correctly transformed to 504 Anthropic error payload:", res_data)
+finally:
+    Proxy.forward_request = orig_forward
+print("Test 18 passed!")
+
 print("\n==========================================")
 print("ALL PROXY TESTS PASSED WITH 100% SUCCESS!")
 print("==========================================")
