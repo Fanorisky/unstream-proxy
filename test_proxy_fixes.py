@@ -3,7 +3,7 @@ import sys
 import json
 
 # Add current dir to sys.path
-sys.path.insert(0, r"D:\Projects\unstream-proxy")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import Proxy
 
@@ -137,28 +137,39 @@ print("Test 8 passed!")
 
 # Test 9: Connection error suppression in _ThreadingProxyServer
 print("\n--- Test 9: _ThreadingProxyServer error suppression ---")
-class DummyServer(Proxy._ThreadingProxyServer):
-    def __init__(self):
-        self.super_called = False
-    def super_handle_error(self, req, addr):
-        self.super_called = True
+super_called = []
+orig_handle_error = Proxy.ThreadingHTTPServer.handle_error
+def mock_parent_handle_error(self, req, addr):
+    super_called.append((req, addr))
 
-server = DummyServer()
-# Simulate ConnectionResetError (10054)
+Proxy.ThreadingHTTPServer.handle_error = mock_parent_handle_error
 try:
-    raise ConnectionResetError("[WinError 10054] An existing connection was forcibly closed")
-except ConnectionResetError:
-    server.handle_error(None, ("127.0.0.1", 62727))
-assert not server.super_called, "ConnectionResetError should be suppressed!"
+    server = Proxy._ThreadingProxyServer.__new__(Proxy._ThreadingProxyServer)
 
-# Simulate ConnectionAbortedError (10053)
-try:
-    raise ConnectionAbortedError("[WinError 10053] An established connection was aborted")
-except ConnectionAbortedError:
-    server.handle_error(None, ("127.0.0.1", 63449))
-assert not server.super_called, "ConnectionAbortedError should be suppressed!"
+    # 1. ConnectionResetError (10054) - should be suppressed
+    try:
+        raise ConnectionResetError("[WinError 10054] An existing connection was forcibly closed")
+    except ConnectionResetError:
+        server.handle_error(None, ("127.0.0.1", 62727))
+    assert len(super_called) == 0, f"ConnectionResetError should be suppressed, but parent called: {super_called}"
 
-print("Connection errors correctly suppressed without traceback!")
+    # 2. ConnectionAbortedError (10053) - should be suppressed
+    try:
+        raise ConnectionAbortedError("[WinError 10053] An established connection was aborted")
+    except ConnectionAbortedError:
+        server.handle_error(None, ("127.0.0.1", 63449))
+    assert len(super_called) == 0, f"ConnectionAbortedError should be suppressed, but parent called: {super_called}"
+
+    # 3. Non-connection error - should NOT be suppressed
+    try:
+        raise RuntimeError("Non-connection error")
+    except RuntimeError:
+        server.handle_error(None, ("127.0.0.1", 55555))
+    assert len(super_called) == 1, "RuntimeError should NOT be suppressed!"
+finally:
+    Proxy.ThreadingHTTPServer.handle_error = orig_handle_error
+
+print("Connection errors correctly suppressed and other errors forwarded!")
 print("Test 9 passed!")
 
 # Test 10: get_json with malformed / non-JSON input
@@ -205,7 +216,23 @@ edge_stream = "".join(list(Proxy.generate_sse_stream(edge_resp)))
 assert "raw string block" in edge_stream
 assert "Bash" in edge_stream
 print("Edge case SSE streaming verified!")
-print("Test 13 passed!")
+# Test 14: Unparseable non-empty body returns None, not {}
+print("\n--- Test 14: Unparseable non-empty body handling ---")
+bad_call = Proxy.parse_tool_call("this is completely invalid garbage not json", opener_name="Bash")
+assert bad_call is None, f"Expected None for invalid non-empty body, got {bad_call}"
+print("Unparseable non-empty body correctly returned None!")
+print("Test 14 passed!")
+
+# Test 15: JSON body starting with { and containing <parameter in string
+print("\n--- Test 15: JSON body containing <parameter in string ---")
+json_with_tag = '{"file": "test.xml", "content": "<parameter name=\\"x\\">val</parameter>"}'
+call_with_tag = Proxy.parse_tool_call(json_with_tag, opener_name="Write")
+assert call_with_tag is not None
+assert call_with_tag[0] == "Write"
+assert call_with_tag[1]["file"] == "test.xml"
+assert "<parameter" in call_with_tag[1]["content"]
+print("JSON body with <parameter string correctly preserved!")
+print("Test 15 passed!")
 
 print("\n==========================================")
 print("ALL PROXY TESTS PASSED WITH 100% SUCCESS!")

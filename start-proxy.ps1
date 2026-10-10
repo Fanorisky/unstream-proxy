@@ -71,7 +71,7 @@ function Get-PortOwners {
 
 $owners = Get-PortOwners -OnPort $Port
 if ($owners.Count -gt 0) {
-    if (Test-OurProxy -OnPort $Port) {
+    if (-not $Service -and (Test-OurProxy -OnPort $Port)) {
         Write-Ok "proxy already healthy on http://127.0.0.1:$Port (PID $($owners -join ', ')) -- nothing to do"
         exit 0
     }
@@ -81,13 +81,23 @@ if ($owners.Count -gt 0) {
 
 # 1. Locate Python
 Write-Step 'Locating Python interpreter'
-$python = (Get-Command python -ErrorAction SilentlyContinue).Source
-if (-not $python) { $python = (Get-Command py -ErrorAction SilentlyContinue).Source }
+$python = $null
+$pyVersion = $null
+foreach ($candidate in @('python', 'py')) {
+    $cmd = (Get-Command $candidate -ErrorAction SilentlyContinue).Source
+    if ($cmd) {
+        $ver = & $cmd --version 2>&1
+        if ($LASTEXITCODE -eq 0 -and $ver) {
+            $python = $cmd
+            $pyVersion = $ver
+            break
+        }
+    }
+}
 if (-not $python) {
-    Write-Err 'No Python interpreter found on PATH. Install Python 3.8+ and re-run.'
+    Write-Err 'No working Python interpreter found on PATH. Install Python 3.8+ and re-run.'
     exit 1
 }
-$pyVersion = & $python --version 2>&1
 Write-Ok "interpreter: $pyVersion"
 
 # 2. Start Proxy
@@ -110,7 +120,13 @@ if ($Service) {
 
     while ($true) {
         $startedAt = Get-Date
-        & $python -u $proxyScript 2>&1 | ForEach-Object { Write-Line ([string]$_) }
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $python -u $proxyScript 2>&1 | ForEach-Object { Write-Line ([string]$_) }
+        } finally {
+            $ErrorActionPreference = $prevEAP
+        }
         $code    = $LASTEXITCODE
         $ranFor  = ((Get-Date) - $startedAt).TotalSeconds
         Write-Warn "Proxy exited with code $code after $([math]::Round($ranFor))s"

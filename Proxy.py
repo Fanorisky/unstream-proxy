@@ -1005,6 +1005,12 @@ def salvage_json(raw, allow_prefix=False):
     candidate = (raw or "").strip()
     if not candidate:
         return None
+    try:
+        direct = json.loads(candidate)
+        if isinstance(direct, dict):
+            return direct
+    except ValueError:
+        pass
     candidate = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", candidate)
     candidate = re.sub(r"\s*```\s*$", "", candidate)
     candidate = strip_emulation_noise(candidate).strip()
@@ -1080,15 +1086,13 @@ def parse_tool_call(raw, allow_prefix=False, opener_name=None):
             return opener_name, {}
         return None
 
-    if PARAM_OPENER_RE.search(text):
+    if not text.startswith("{") and PARAM_OPENER_RE.search(text):
         if not opener_name:
             return None
         return opener_name, parse_parameters(text)
 
     parsed = salvage_json(text, allow_prefix)
     if not isinstance(parsed, dict):
-        if opener_name:
-            return opener_name, {}
         return None
 
     name = parsed.get("name") or parsed.get("tool") or opener_name
@@ -1272,8 +1276,8 @@ def split_emulated_calls(text):
         body_start = match.end()
         limit = starts[index + 1].start() if index + 1 < len(starts) else len(text)
         segment = text[body_start:limit]
-        closer = (CALL_CLOSER_RE if PARAM_OPENER_RE.search(segment.lstrip())
-                  else CLOSER_RE).search(segment)
+        is_param = not segment.lstrip().startswith("{") and bool(PARAM_OPENER_RE.search(segment.lstrip()))
+        closer = (CALL_CLOSER_RE if is_param else CLOSER_RE).search(segment)
         if closer:
             body = segment[:closer.start()]
             end = body_start + closer.end()
