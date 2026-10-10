@@ -30,9 +30,13 @@ class _RequestProxy(threading.local):
         self._headers = headers
 
     def get_json(self):
-        if not getattr(self, "_raw_body", b""):
+        raw = getattr(self, "_raw_body", b"")
+        if not raw:
             return None
-        return json.loads(self._raw_body.decode("utf-8"))
+        try:
+            return json.loads(raw.decode("utf-8", errors="replace"))
+        except (ValueError, TypeError):
+            return None
 
     @property
     def content_length(self):
@@ -105,6 +109,7 @@ config = {
 # it as auth failure and abort. 503 "no available channel" clears within a minute.
 RETRY_POLICY = {
     403: (2.0, 5.0, 10.0),
+    429: (2.0, 5.0, 10.0),
     503: (15.0, 20.0, 25.0),
 }
 
@@ -349,6 +354,9 @@ def forward_request(body, headers):
         if not delays or attempt > len(delays):
             return response
         delay = delays[attempt - 1]
+        retry_after = response.headers.get("retry-after")
+        if retry_after and retry_after.isdigit():
+            delay = max(delay, min(float(retry_after), 30.0))
         log_message(f"Upstream returned {response.status_code}, "
                     f"retrying in {delay:.1f}s ({attempt}/{MAX_ATTEMPTS - 1})")
         time.sleep(delay)
@@ -356,13 +364,26 @@ def forward_request(body, headers):
 
 
 def passthrough_error(response):
-    """Return the upstream failure unchanged; never raise on a non-JSON body."""
+    """Return the upstream failure; format as valid Anthropic JSON error if upstream returns non-JSON."""
     try:
         return jsonify(json.loads(response.content)), response.status_code
     except ValueError:
-        content_type = response.headers.get("content-type") or "text/plain"
-        return Response(response.content, status=response.status_code,
-                        content_type=content_type)
+        msg = response.text.strip()
+        if "<html" in msg.lower() or "<body" in msg.lower():
+            title_match = re.search(r"<title>(.*?)</title>", msg, re.IGNORECASE)
+            title = title_match.group(1).strip() if title_match else f"Upstream error {response.status_code}"
+            err_msg = f"{title} (upstream HTTP {response.status_code})"
+        else:
+            err_msg = msg[:500] or f"Upstream returned HTTP {response.status_code}"
+
+        err_payload = {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": err_msg
+            }
+        }
+        return jsonify(err_payload), response.status_code
 
 
 
@@ -405,20 +426,41 @@ NATIVE_MAP = {
 TOOL_CALL_CLOSE = "</invoke>"
 # Any of these opens a call. <tool_call> + JSON is what we asked for before and old
 # transcripts still carry it, so it has to keep parsing.
-CALL_OPENER_RE = re.compile(r"<\s*(?:antml:)?(tool_call|invoke)\b([^>]*?)/?>", re.IGNORECASE)
+CALL_OPENER_RE = re.compile(
+    r"<\s*(?:antml:)?(tool_call|invoke|function_call|tool_use)\b([^>]*?)(/?)>",
+    re.IGNORECASE)
 PARAM_OPENER_RE = re.compile(r"<\s*(?:antml:)?parameter\b", re.IGNORECASE)
 PARAMETER_RE = re.compile(
     r"<\s*(?:antml:)?parameter\b([^>]*?)>(.*?)<\s*/\s*(?:antml:)?parameter\s*>",
     re.IGNORECASE | re.DOTALL)
-TAG_NAME_RE = re.compile(r'name\s*=\s*"([^"]*)"', re.IGNORECASE)
+TAG_NAME_RE = re.compile(
+    r'(?:name|tool|function)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))',
+    re.IGNORECASE)
+
+
+def extract_tag_name(text):
+    if not text:
+        return None
+    m = TAG_NAME_RE.search(text)
+    if not m:
+        return None
+    return m.group(1) or m.group(2) or m.group(3)
+
+
+NAME_TAG_RE = re.compile(
+    r"<\s*(?:antml:)?name\b[^>]*>(.*?)<\s*/\s*(?:antml:)?name\s*>",
+    re.IGNORECASE | re.DOTALL)
+ARGS_TAG_RE = re.compile(
+    r"<\s*(?:antml:)?(?:arguments|parameters)\b[^>]*>(.*?)<\s*/\s*(?:antml:)?(?:arguments|parameters)\s*>",
+    re.IGNORECASE | re.DOTALL)
 # Every closing tag the model has been seen to write, including ones that do not
 # match the opener it used - that mismatch is the most common way a call arrives.
 CLOSER_RE = re.compile(
-    r"</\s*(?:antml:)?(?:tool_call|invoke|tool_calls|function_calls|function_call"
+    r"</\s*(?:antml:)?(?:tool_call|invoke|tool_calls|function_calls|function_call|tool_use"
     r"|parameter)\s*>", re.IGNORECASE)
 # The subset that ends the call itself, as opposed to a single argument.
 CALL_CLOSER_RE = re.compile(
-    r"</\s*(?:antml:)?(?:tool_call|invoke|tool_calls|function_calls|function_call)"
+    r"</\s*(?:antml:)?(?:tool_call|invoke|tool_calls|function_calls|function_call|tool_use)"
     r"\s*>", re.IGNORECASE)
 # The model sometimes invents harness chatter inside its own reply - notably faked
 # <system-reminder> blocks. They are model output, not ours, and they must never
@@ -428,7 +470,7 @@ REMINDER_BLOCK_RE = re.compile(
 REMINDER_TAG_RE = re.compile(r"</?system-reminder\b[^>]*>", re.IGNORECASE)
 STRAY_MARKUP_RE = re.compile(
     r"</?(?:antml:)?(?:tool_call|invoke|parameter|function_call|tool_calls"
-    r"|function_calls)\b[^>]*>", re.IGNORECASE)
+    r"|function_calls|tool_use)\b[^>]*>", re.IGNORECASE)
 TOOL_ID_MAP = {}
 
 
@@ -627,6 +669,7 @@ def build_tool_instructions(tools, tool_choice=None, native_pairs=None):
             "",
             "Each argument is one <parameter name=\"key\"> value. Scalars are written as",
             "plain text; a list or an object is written as JSON inside its parameter.",
+            "For tools with no parameters, write <invoke name=\"tool_name\"></invoke>.",
             "Close the block with exactly </invoke>.",
             "",
             "Write each block on its own, with no prose inside it, and stop writing",
@@ -962,6 +1005,12 @@ def salvage_json(raw, allow_prefix=False):
     candidate = (raw or "").strip()
     if not candidate:
         return None
+    try:
+        direct = json.loads(candidate)
+        if isinstance(direct, dict):
+            return direct
+    except ValueError:
+        pass
     candidate = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", candidate)
     candidate = re.sub(r"\s*```\s*$", "", candidate)
     candidate = strip_emulation_noise(candidate).strip()
@@ -1001,14 +1050,14 @@ def parse_parameters(body):
     """
     arguments = {}
     for match in PARAMETER_RE.finditer(body):
-        key = TAG_NAME_RE.search(match.group(1))
+        key = extract_tag_name(match.group(1) or "")
         if not key:
             continue
         raw = match.group(2).strip()
         try:
-            arguments[key.group(1)] = json.loads(raw)
+            arguments[key] = json.loads(raw)
         except ValueError:
-            arguments[key.group(1)] = raw
+            arguments[key] = raw
     return arguments
 
 
@@ -1019,15 +1068,33 @@ def parse_tool_call(raw, allow_prefix=False, opener_name=None):
     an <invoke> body carries its name; a JSON body carries its own.
     """
     text = (raw or "").strip()
+
+    # If opener didn't specify name in attribute, check for <name>...</name> child tag
+    if not opener_name:
+        name_match = NAME_TAG_RE.search(text)
+        if name_match:
+            opener_name = name_match.group(1).strip()
+            text = (text[:name_match.start()] + text[name_match.end():]).strip()
+
+    # Check for <arguments>...</arguments> or <parameters>...</parameters> wrapper
+    args_match = ARGS_TAG_RE.search(text)
+    if args_match:
+        text = args_match.group(1).strip()
+
     if not text:
+        if opener_name:
+            return opener_name, {}
         return None
-    if PARAM_OPENER_RE.match(text):
+
+    if not text.startswith("{") and PARAM_OPENER_RE.search(text):
         if not opener_name:
             return None
         return opener_name, parse_parameters(text)
+
     parsed = salvage_json(text, allow_prefix)
     if not isinstance(parsed, dict):
         return None
+
     name = parsed.get("name") or parsed.get("tool") or opener_name
     if any(key in parsed for key in ("input", "arguments", "parameters")):
         arguments = parsed.get("input", parsed.get("arguments", parsed.get("parameters", {})))
@@ -1200,11 +1267,17 @@ def split_emulated_calls(text):
     spans = []
     starts = list(CALL_OPENER_RE.finditer(text))
     for index, match in enumerate(starts):
+        attr_name = extract_tag_name(match.group(2) or "")
+        is_self_closing = bool(match.group(3) == "/" or match.group(0).rstrip().endswith("/>"))
+        if is_self_closing:
+            spans.append((match.start(), match.end(), "", attr_name))
+            continue
+
         body_start = match.end()
         limit = starts[index + 1].start() if index + 1 < len(starts) else len(text)
         segment = text[body_start:limit]
-        closer = (CALL_CLOSER_RE if PARAM_OPENER_RE.match(segment.lstrip())
-                  else CLOSER_RE).search(segment)
+        is_param = not segment.lstrip().startswith("{") and bool(PARAM_OPENER_RE.search(segment.lstrip()))
+        closer = (CALL_CLOSER_RE if is_param else CLOSER_RE).search(segment)
         if closer:
             body = segment[:closer.start()]
             end = body_start + closer.end()
@@ -1217,8 +1290,7 @@ def split_emulated_calls(text):
         else:
             body = segment
             end = limit
-        attr = TAG_NAME_RE.search(match.group(2) or "")
-        spans.append((match.start(), end, body, attr.group(1) if attr else None))
+        spans.append((match.start(), end, body, attr_name))
     return spans
 
 
@@ -1277,6 +1349,9 @@ def extract_tool_calls(response_data):
             # Our own stop sequence fired - the client never asked for it.
             response_data["stop_reason"] = "end_turn"
             response_data["stop_sequence"] = None
+        elif response_data.get("stop_reason") == "tool_use":
+            # Safety guard: stop_reason cannot be tool_use if no tool_use blocks exist
+            response_data["stop_reason"] = "end_turn"
     return response_data
 
 
@@ -1331,6 +1406,8 @@ def sanitize_usage(response_data, prompt_bytes=None):
     prompt reached Claude Code as 1,493,494 and forced an auto-compact loop. Drop the
     copy in input_tokens, then let choose_prompt_total read the cache figures.
     """
+    if not isinstance(response_data, dict):
+        return response_data
     usage = response_data.get("usage")
     if not isinstance(usage, dict):
         return response_data
@@ -1390,6 +1467,8 @@ def generate_sse_stream(response_data):
     # 2. one start/delta/stop triple per content block
     content = response_data.get('content', [])
     for i, block in enumerate(content):
+        if not isinstance(block, dict):
+            block = {"type": "text", "text": str(block)}
         block_type = block.get("type", "text")
 
         if block_type == "tool_use":
@@ -1404,12 +1483,14 @@ def generate_sse_stream(response_data):
                 }
             }
             yield f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n"
+            raw_input = block.get("input", {})
+            partial_json = raw_input if isinstance(raw_input, str) else json.dumps(raw_input or {})
             block_delta = {
                 "type": "content_block_delta",
                 "index": i,
                 "delta": {
                     "type": "input_json_delta",
-                    "partial_json": json.dumps(block.get("input", {}))
+                    "partial_json": partial_json
                 }
             }
             yield f"event: content_block_delta\ndata: {json.dumps(block_delta)}\n\n"
@@ -1426,6 +1507,13 @@ def generate_sse_stream(response_data):
                     "type": "content_block_delta",
                     "index": i,
                     "delta": {"type": "thinking_delta", "thinking": block["thinking"]}
+                }
+                yield f"event: content_block_delta\ndata: {json.dumps(block_delta)}\n\n"
+            if block.get("signature"):
+                block_delta = {
+                    "type": "content_block_delta",
+                    "index": i,
+                    "delta": {"type": "signature_delta", "signature": block["signature"]}
                 }
                 yield f"event: content_block_delta\ndata: {json.dumps(block_delta)}\n\n"
 
@@ -1487,9 +1575,20 @@ class _ProxyHTTPHandler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass  # the proxy has its own logger; silence the default stderr spam
 
+    def handle(self):
+        """Wrap request handling to cleanly swallow client disconnects/resets."""
+        try:
+            super().handle()
+        except (ConnectionError, TimeoutError):
+            pass
+
     def _read_body(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        return self.rfile.read(length) if length else b""
+        val = self.headers.get("Content-Length")
+        length = int(val) if val and val.isdigit() else 0
+        try:
+            return self.rfile.read(length) if length else b""
+        except (ConnectionError, TimeoutError):
+            return b""
 
     def _path_only(self):
         """The path with any query string removed.
@@ -1502,11 +1601,46 @@ class _ProxyHTTPHandler(BaseHTTPRequestHandler):
         """
         return self.path.split("?", 1)[0].rstrip("/") or "/"
 
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.end_headers()
+
     def do_GET(self):
-        if self._path_only() == "/health":
+        path = self._path_only()
+        if path == "/health":
             payload = json.dumps({"status": "ok"}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        elif path in ("/v1/models", "/models"):
+            # Provide model catalog for Claude Desktop / client discovery
+            default_mod = config.get("model_map", {}).get("*", "claude-opus-4-8")
+            known_models = [default_mod]
+            for m in ("claude-opus-4-8", "claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022", "claude-3-opus-20240229"):
+                if m not in known_models:
+                    known_models.append(m)
+            payload = json.dumps({
+                "object": "list",
+                "data": [
+                    {
+                        "id": m,
+                        "object": "model",
+                        "created": 1720000000,
+                        "owned_by": "anthropic"
+                    }
+                    for m in known_models
+                ]
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
@@ -1523,6 +1657,7 @@ class _ProxyHTTPHandler(BaseHTTPRequestHandler):
             log_message(f"count_tokens -> {tokens} (local estimate)")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
@@ -1557,14 +1692,15 @@ class _ProxyHTTPHandler(BaseHTTPRequestHandler):
 
     def _send(self, result):
         resp = self._normalise(result)
-        if resp.streaming:
-            self.send_response(resp.status)
-            self.send_header("Content-Type", resp.content_type)
-            for key, value in resp.headers.items():
-                self.send_header(key, value)
-            self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
-            try:
+        try:
+            if resp.streaming:
+                self.send_response(resp.status)
+                self.send_header("Content-Type", resp.content_type)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                for key, value in resp.headers.items():
+                    self.send_header(key, value)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
                 for chunk in resp.body:
                     if not chunk:
                         continue
@@ -1572,19 +1708,21 @@ class _ProxyHTTPHandler(BaseHTTPRequestHandler):
                     self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
                     self.wfile.flush()
                 self.wfile.write(b"0\r\n\r\n")
-            except (BrokenPipeError, ConnectionResetError):
-                log_message("client disconnected mid-stream")
-        else:
-            self.send_response(resp.status)
-            self.send_header("Content-Type", resp.content_type)
-            for key, value in resp.headers.items():
-                self.send_header(key, value)
-            self.send_header("Content-Length", str(len(resp.body)))
-            self.end_headers()
-            try:
+                self.wfile.flush()
+            else:
+                self.send_response(resp.status)
+                self.send_header("Content-Type", resp.content_type)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                for key, value in resp.headers.items():
+                    self.send_header(key, value)
+                self.send_header("Content-Length", str(len(resp.body)))
+                self.end_headers()
                 self.wfile.write(resp.body)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+                self.wfile.flush()
+        except (ConnectionError, BrokenPipeError):
+            log_message("client disconnected before response completed")
+        except Exception as e:
+            log_message(f"Error during response transmission: {e}")
 
 
 def estimate_input_tokens(raw_body):
@@ -1598,9 +1736,19 @@ def estimate_input_tokens(raw_body):
     return max(1, int(len(raw_body or b"") / 3.3))
 
 
+class _ThreadingProxyServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        cls, err, _ = sys.exc_info()
+        if cls and issubclass(cls, (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def make_proxy_server(host, port):
     """Build a threaded stdlib HTTP server bound to host:port."""
-    return ThreadingHTTPServer((host, port), _ProxyHTTPHandler)
+    return _ThreadingProxyServer((host, port), _ProxyHTTPHandler)
 
 def main():
     """Entry point for pm2 / systemd / direct `python3 Proxy.py`.
@@ -1613,6 +1761,19 @@ def main():
         EMULATE_TOOLS  true / false               (default true)
         DEFAULT_MODEL  fallback model for any requested name
     """
+    # If config.json exists, load defaults from its env block
+    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    if os.path.exists(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg_obj = json.load(f)
+                env_dict = cfg_obj.get("apps", [{}])[0].get("env", {}) if "apps" in cfg_obj else cfg_obj
+                for k, v in env_dict.items():
+                    if k not in os.environ:
+                        os.environ[k] = str(v)
+        except Exception as e:
+            print(f"Notice: could not load config.json: {e}", flush=True)
+
     config["target_url"] = os.environ.get("TARGET_URL", config["target_url"]).rstrip("/")
     config["api_key"] = os.environ.get("API_KEY", "")
     config["port"] = int(os.environ.get("PORT", "8181"))
