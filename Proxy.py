@@ -30,9 +30,13 @@ class _RequestProxy(threading.local):
         self._headers = headers
 
     def get_json(self):
-        if not getattr(self, "_raw_body", b""):
+        raw = getattr(self, "_raw_body", b"")
+        if not raw:
             return None
-        return json.loads(self._raw_body.decode("utf-8"))
+        try:
+            return json.loads(raw.decode("utf-8", errors="replace"))
+        except (ValueError, TypeError):
+            return None
 
     @property
     def content_length(self):
@@ -105,6 +109,7 @@ config = {
 # it as auth failure and abort. 503 "no available channel" clears within a minute.
 RETRY_POLICY = {
     403: (2.0, 5.0, 10.0),
+    429: (2.0, 5.0, 10.0),
     503: (15.0, 20.0, 25.0),
 }
 
@@ -349,6 +354,9 @@ def forward_request(body, headers):
         if not delays or attempt > len(delays):
             return response
         delay = delays[attempt - 1]
+        retry_after = response.headers.get("retry-after")
+        if retry_after and retry_after.isdigit():
+            delay = max(delay, min(float(retry_after), 30.0))
         log_message(f"Upstream returned {response.status_code}, "
                     f"retrying in {delay:.1f}s ({attempt}/{MAX_ATTEMPTS - 1})")
         time.sleep(delay)
@@ -356,13 +364,26 @@ def forward_request(body, headers):
 
 
 def passthrough_error(response):
-    """Return the upstream failure unchanged; never raise on a non-JSON body."""
+    """Return the upstream failure; format as valid Anthropic JSON error if upstream returns non-JSON."""
     try:
         return jsonify(json.loads(response.content)), response.status_code
     except ValueError:
-        content_type = response.headers.get("content-type") or "text/plain"
-        return Response(response.content, status=response.status_code,
-                        content_type=content_type)
+        msg = response.text.strip()
+        if "<html" in msg.lower() or "<body" in msg.lower():
+            title_match = re.search(r"<title>(.*?)</title>", msg, re.IGNORECASE)
+            title = title_match.group(1).strip() if title_match else f"Upstream error {response.status_code}"
+            err_msg = f"{title} (upstream HTTP {response.status_code})"
+        else:
+            err_msg = msg[:500] or f"Upstream returned HTTP {response.status_code}"
+
+        err_payload = {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": err_msg
+            }
+        }
+        return jsonify(err_payload), response.status_code
 
 
 
@@ -1381,6 +1402,8 @@ def sanitize_usage(response_data, prompt_bytes=None):
     prompt reached Claude Code as 1,493,494 and forced an auto-compact loop. Drop the
     copy in input_tokens, then let choose_prompt_total read the cache figures.
     """
+    if not isinstance(response_data, dict):
+        return response_data
     usage = response_data.get("usage")
     if not isinstance(usage, dict):
         return response_data
@@ -1440,6 +1463,8 @@ def generate_sse_stream(response_data):
     # 2. one start/delta/stop triple per content block
     content = response_data.get('content', [])
     for i, block in enumerate(content):
+        if not isinstance(block, dict):
+            block = {"type": "text", "text": str(block)}
         block_type = block.get("type", "text")
 
         if block_type == "tool_use":
@@ -1454,12 +1479,14 @@ def generate_sse_stream(response_data):
                 }
             }
             yield f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n"
+            raw_input = block.get("input", {})
+            partial_json = raw_input if isinstance(raw_input, str) else json.dumps(raw_input or {})
             block_delta = {
                 "type": "content_block_delta",
                 "index": i,
                 "delta": {
                     "type": "input_json_delta",
-                    "partial_json": json.dumps(block.get("input", {}))
+                    "partial_json": partial_json
                 }
             }
             yield f"event: content_block_delta\ndata: {json.dumps(block_delta)}\n\n"
@@ -1544,9 +1571,20 @@ class _ProxyHTTPHandler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass  # the proxy has its own logger; silence the default stderr spam
 
+    def handle(self):
+        """Wrap request handling to cleanly swallow client disconnects/resets."""
+        try:
+            super().handle()
+        except (ConnectionError, TimeoutError):
+            pass
+
     def _read_body(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        return self.rfile.read(length) if length else b""
+        val = self.headers.get("Content-Length")
+        length = int(val) if val and val.isdigit() else 0
+        try:
+            return self.rfile.read(length) if length else b""
+        except (ConnectionError, TimeoutError):
+            return b""
 
     def _path_only(self):
         """The path with any query string removed.
@@ -1579,15 +1617,21 @@ class _ProxyHTTPHandler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
         elif path in ("/v1/models", "/models"):
             # Provide model catalog for Claude Desktop / client discovery
+            default_mod = config.get("model_map", {}).get("*", "claude-opus-4-8")
+            known_models = [default_mod]
+            for m in ("claude-opus-4-8", "claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022", "claude-3-opus-20240229"):
+                if m not in known_models:
+                    known_models.append(m)
             payload = json.dumps({
                 "object": "list",
                 "data": [
                     {
-                        "id": "claude-opus-4-8",
+                        "id": m,
                         "object": "model",
                         "created": 1720000000,
                         "owned_by": "anthropic"
                     }
+                    for m in known_models
                 ]
             }).encode("utf-8")
             self.send_response(200)
@@ -1644,15 +1688,15 @@ class _ProxyHTTPHandler(BaseHTTPRequestHandler):
 
     def _send(self, result):
         resp = self._normalise(result)
-        if resp.streaming:
-            self.send_response(resp.status)
-            self.send_header("Content-Type", resp.content_type)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            for key, value in resp.headers.items():
-                self.send_header(key, value)
-            self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
-            try:
+        try:
+            if resp.streaming:
+                self.send_response(resp.status)
+                self.send_header("Content-Type", resp.content_type)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                for key, value in resp.headers.items():
+                    self.send_header(key, value)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
                 for chunk in resp.body:
                     if not chunk:
                         continue
@@ -1660,20 +1704,21 @@ class _ProxyHTTPHandler(BaseHTTPRequestHandler):
                     self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
                     self.wfile.flush()
                 self.wfile.write(b"0\r\n\r\n")
-            except (BrokenPipeError, ConnectionResetError):
-                log_message("client disconnected mid-stream")
-        else:
-            self.send_response(resp.status)
-            self.send_header("Content-Type", resp.content_type)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            for key, value in resp.headers.items():
-                self.send_header(key, value)
-            self.send_header("Content-Length", str(len(resp.body)))
-            self.end_headers()
-            try:
+                self.wfile.flush()
+            else:
+                self.send_response(resp.status)
+                self.send_header("Content-Type", resp.content_type)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                for key, value in resp.headers.items():
+                    self.send_header(key, value)
+                self.send_header("Content-Length", str(len(resp.body)))
+                self.end_headers()
                 self.wfile.write(resp.body)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+                self.wfile.flush()
+        except (ConnectionError, BrokenPipeError):
+            log_message("client disconnected before response completed")
+        except Exception as e:
+            log_message(f"Error during response transmission: {e}")
 
 
 def estimate_input_tokens(raw_body):
@@ -1687,9 +1732,19 @@ def estimate_input_tokens(raw_body):
     return max(1, int(len(raw_body or b"") / 3.3))
 
 
+class _ThreadingProxyServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        cls, err, _ = sys.exc_info()
+        if cls and issubclass(cls, (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def make_proxy_server(host, port):
     """Build a threaded stdlib HTTP server bound to host:port."""
-    return ThreadingHTTPServer((host, port), _ProxyHTTPHandler)
+    return _ThreadingProxyServer((host, port), _ProxyHTTPHandler)
 
 def main():
     """Entry point for pm2 / systemd / direct `python3 Proxy.py`.

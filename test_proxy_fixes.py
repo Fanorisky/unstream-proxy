@@ -135,6 +135,78 @@ print("SSE generation verified successfully! Output sample:")
 print(sse_output[:300] + "...")
 print("Test 8 passed!")
 
+# Test 9: Connection error suppression in _ThreadingProxyServer
+print("\n--- Test 9: _ThreadingProxyServer error suppression ---")
+class DummyServer(Proxy._ThreadingProxyServer):
+    def __init__(self):
+        self.super_called = False
+    def super_handle_error(self, req, addr):
+        self.super_called = True
+
+server = DummyServer()
+# Simulate ConnectionResetError (10054)
+try:
+    raise ConnectionResetError("[WinError 10054] An existing connection was forcibly closed")
+except ConnectionResetError:
+    server.handle_error(None, ("127.0.0.1", 62727))
+assert not server.super_called, "ConnectionResetError should be suppressed!"
+
+# Simulate ConnectionAbortedError (10053)
+try:
+    raise ConnectionAbortedError("[WinError 10053] An established connection was aborted")
+except ConnectionAbortedError:
+    server.handle_error(None, ("127.0.0.1", 63449))
+assert not server.super_called, "ConnectionAbortedError should be suppressed!"
+
+print("Connection errors correctly suppressed without traceback!")
+print("Test 9 passed!")
+
+# Test 10: get_json with malformed / non-JSON input
+print("\n--- Test 10: get_json defensive parsing ---")
+proxy_req = Proxy._RequestProxy()
+proxy_req.bind(b"not valid json {{{", {})
+assert proxy_req.get_json() is None, "Malformed JSON should return None, not raise!"
+proxy_req.bind(b'{"valid": true}', {})
+assert proxy_req.get_json() == {"valid": True}
+print("Defensive get_json verified!")
+print("Test 10 passed!")
+
+# Test 11: passthrough_error wraps Cloudflare HTML into JSON
+print("\n--- Test 11: passthrough_error HTML wrapping ---")
+cf_html = b"<html><head><title>524 Origin Time-out</title></head><body>error code: 524</body></html>"
+mock_upstream = Proxy.UpstreamResponse(524, cf_html, {"content-type": "text/html"})
+res_tuple = Proxy.passthrough_error(mock_upstream)
+assert isinstance(res_tuple[0], Proxy.Response)
+assert res_tuple[1] == 524
+res_json = json.loads(res_tuple[0].body.decode("utf-8"))
+assert res_json.get("type") == "error"
+assert "524" in res_json["error"]["message"]
+print("Cloudflare HTML 524 wrapped to JSON:", res_json)
+print("Test 11 passed!")
+
+# Test 12: RETRY_POLICY has 429 and 503
+print("\n--- Test 12: RETRY_POLICY configuration ---")
+assert 429 in Proxy.RETRY_POLICY, "429 should be in RETRY_POLICY"
+assert 403 in Proxy.RETRY_POLICY, "403 should be in RETRY_POLICY"
+assert 503 in Proxy.RETRY_POLICY, "503 should be in RETRY_POLICY"
+print("RETRY_POLICY verified:", Proxy.RETRY_POLICY)
+print("Test 12 passed!")
+
+# Test 13: SSE streaming handles string inputs and non-dict content blocks
+print("\n--- Test 13: Robust SSE streaming with edge cases ---")
+edge_resp = {
+    "role": "assistant",
+    "content": [
+        "raw string block instead of dict",
+        {"type": "tool_use", "id": "t1", "name": "Bash", "input": '{"command":"ls"}'}
+    ]
+}
+edge_stream = "".join(list(Proxy.generate_sse_stream(edge_resp)))
+assert "raw string block" in edge_stream
+assert "Bash" in edge_stream
+print("Edge case SSE streaming verified!")
+print("Test 13 passed!")
+
 print("\n==========================================")
 print("ALL PROXY TESTS PASSED WITH 100% SUCCESS!")
 print("==========================================")
