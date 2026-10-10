@@ -120,7 +120,7 @@ RETRY_POLICY = {
 # across the board - the safe side of that ambiguity. Only a genuine failure to
 # establish or keep the connection (refused, reset, DNS, RemoteDisconnected) is
 # retried; see is_retryable_transport_error.
-RETRY_EXCEPTION_DELAYS = (0.5, 1.0, 1.5)
+RETRY_EXCEPTION_DELAYS = (1.0, 2.0, 4.0)
 MAX_ATTEMPTS = 4
 # urllib takes a single timeout rather than Flask/requests' (connect, read) pair.
 # The read side is what matters here - the relay can be slow - so the whole call
@@ -281,10 +281,31 @@ def proxy_messages():
             return jsonify(response_data), 200
             
     except Exception as e:
-        log_message(f"Proxy error: {e}")
-        import traceback
-        log_message(f"   Traceback: {traceback.format_exc()}")
-        return jsonify({"error": {"message": str(e)}}), 500
+        is_timeout = isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), socket.timeout)
+        is_transport_err = isinstance(e, (urllib.error.URLError, ConnectionError, socket.error))
+        if is_timeout:
+            log_message(f"Upstream timed out: {e}")
+            err_msg = f"Upstream timed out: {e}"
+            status = 504
+        elif is_transport_err:
+            log_message(f"Upstream connection failed: {e}")
+            err_msg = f"Upstream connection failed: {e}"
+            status = 502
+        else:
+            log_message(f"Proxy error: {e}")
+            import traceback
+            log_message(f"   Traceback: {traceback.format_exc()}")
+            err_msg = f"Internal proxy error: {e}"
+            status = 500
+
+        err_payload = {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": err_msg
+            }
+        }
+        return jsonify(err_payload), status
 
 class UpstreamResponse:
     """requests-like view over a urllib result, so forward_request reads the same.
@@ -1673,7 +1694,13 @@ class _ProxyHTTPHandler(BaseHTTPRequestHandler):
             result = proxy_messages()
         except Exception as error:  # mirror Flask's 500 behaviour
             log_message(f"Handler error: {error}")
-            body = json.dumps({"error": {"message": str(error)}}).encode("utf-8")
+            body = json.dumps({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": str(error)
+                }
+            }).encode("utf-8")
             result = Response(body, status=500)
         self._send(result)
 
